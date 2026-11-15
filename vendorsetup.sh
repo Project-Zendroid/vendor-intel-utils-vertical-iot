@@ -42,11 +42,16 @@ function lunch
         fi
     fi
 
-    aosp_lunch $answer
+    aosp_lunch "$answer" || return $?
 
-    rm -rf vendor/intel/utils/Android.mk vendor/intel/utils_priv/Android.mk
-    rm -rf vendor/intel/utils_vertical/Android.mk
-    vendor/intel/utils_vertical/autopatch.sh
+    local autopatch_target="$TARGET_PRODUCT"
+    case "$autopatch_target" in
+        hp_89c3|pvhk4)
+            autopatch_target="caas"
+            ;;
+    esac
+
+    (cd "$T" && AUTOPATCH_PATCH_TARGET="$autopatch_target"  vendor/intel/utils_vertical/autopatch.sh) || return $?
 
     # check if product configuration files are out of date
     if [[ $(find device/intel -path "*mixins*" -prune -o -name ${TARGET_PRODUCT}.mk -print) ]]; then
