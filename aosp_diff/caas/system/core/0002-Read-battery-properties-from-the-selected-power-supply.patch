@@ -1,0 +1,133 @@
+From 924da7e0857f6759bc181b56998468aaf73f46fa Mon Sep 17 00:00:00 2001
+From: Cyanogen <yangm9820@gmail.com>
+Date: Sat, 21 Nov 2026 14:08:44 +0800
+Subject: [PATCH] healthd: read battery properties from the selected power
+ supply
+
+---
+ healthd/BatteryMonitor.cpp               | 53 +++++++++++++++++++++---
+ healthd/include/healthd/BatteryMonitor.h |  1 +
+ 2 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/healthd/BatteryMonitor.cpp b/healthd/BatteryMonitor.cpp
+index 64c85e2d72..8cd3cd93d9 100644
+--- a/healthd/BatteryMonitor.cpp
++++ b/healthd/BatteryMonitor.cpp
+@@ -370,6 +370,24 @@ static BatteryHealthData *ensureBatteryHealthData(HealthInfo *info) {
+     return &info->batteryHealthData.value();
+ }
+ 
++int64_t BatteryMonitor::getBatteryStateOfHealth() {
++    if (!mHealthdConfig->batteryStateOfHealthPath.empty())
++        return getIntField(mHealthdConfig->batteryStateOfHealthPath);
++
++    // No dedicated node. Derive the remaining full-charge capacity relative
++    // to the rated capacity, using fields of the same battery.
++    if (mHealthdConfig->batteryFullChargePath.empty() ||
++        mHealthdConfig->batteryFullChargeDesignCapacityUahPath.empty())
++        return 0;
++
++    int full = getIntField(mHealthdConfig->batteryFullChargePath);
++    int design = getIntField(mHealthdConfig->batteryFullChargeDesignCapacityUahPath);
++    if (full <= 0 || design <= 0) return 0;
++
++    int pct = (int)(100LL * full / design);
++    return std::clamp(pct, 0, 100);
++}
++
+ void BatteryMonitor::updateValues(void) {
+     initHealthInfo(mHealthInfo.get());
+ 
+@@ -411,9 +429,9 @@ void BatteryMonitor::updateValues(void) {
+     if (!mHealthdConfig->batteryHealthStatusPath.empty())
+         mBatteryHealthStatus = getIntField(mHealthdConfig->batteryHealthStatusPath);
+ 
+-    if (!mHealthdConfig->batteryStateOfHealthPath.empty())
+-        ensureBatteryHealthData(mHealthInfo.get())->batteryStateOfHealth =
+-                getIntField(mHealthdConfig->batteryStateOfHealthPath);
++    int64_t stateOfHealth = getBatteryStateOfHealth();
++    if (!mHealthdConfig->batteryStateOfHealthPath.empty() || stateOfHealth > 0)
++        ensureBatteryHealthData(mHealthInfo.get())->batteryStateOfHealth = stateOfHealth;
+ 
+     if (!mHealthdConfig->batteryManufacturingDatePath.empty())
+         ensureBatteryHealthData(mHealthInfo.get())->batteryManufacturingDateSeconds =
+@@ -443,6 +461,13 @@ void BatteryMonitor::updateValues(void) {
+         mHealthInfo->batteryHealth = getBatteryHealthStatus(mBatteryHealthStatus);
+     }
+ 
++    // No health node: use capacity retention as a coarse indicator.
++    if (mHealthdConfig->batteryHealthPath.empty() &&
++        mHealthdConfig->batteryHealthStatusPath.empty() && stateOfHealth > 0) {
++        mHealthInfo->batteryHealth = stateOfHealth > 40 ? BatteryHealth::GOOD
++                                                        : BatteryHealth::DEAD;
++    }
++
+     if (readFromFile(mHealthdConfig->batteryTechnologyPath, &buf) > 0)
+         mHealthInfo->batteryTechnology = buf;
+ 
+@@ -605,8 +630,7 @@ int BatteryMonitor::getBatteryHealthData(int id) {
+             return getIntField(mHealthdConfig->batteryFirstUsageDatePath);
+     }
+     if (id == BATTERY_PROP_STATE_OF_HEALTH) {
+-        if (!mHealthdConfig->batteryStateOfHealthPath.empty())
+-            return getIntField(mHealthdConfig->batteryStateOfHealthPath);
++        return getBatteryStateOfHealth();
+     }
+     if (id == BATTERY_PROP_PART_STATUS) {
+         return static_cast<int>(BatteryPartStatus::UNSUPPORTED);
+@@ -773,6 +797,7 @@ void BatteryMonitor::init(struct healthd_config *hc) {
+     char pval[PROPERTY_VALUE_MAX];
+ 
+     mHealthdConfig = hc;
++    bool batteryDirSelected = false;
+     std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(POWER_SUPPLY_SYSFS_PATH), closedir);
+     if (dir == NULL) {
+         KLOG_ERROR(LOG_TAG, "Could not open %s\n", POWER_SUPPLY_SYSFS_PATH);
+@@ -810,6 +835,13 @@ void BatteryMonitor::init(struct healthd_config *hc) {
+                 // in BatteryMonitor, which is intended to report the status of
+                 // the battery supplying the power to the whole system.
+                 if (isScopedPowerSupply(name)) continue;
++                // Keep every field of one battery from the same directory
++                // instead of mixing fields from multiple batteries.
++                if (batteryDirSelected) {
++                    KLOG_WARNING(LOG_TAG, "Ignoring additional battery %s\n", name);
++                    break;
++                }
++                batteryDirSelected = true;
+                 mBatteryDevicePresent = true;
+ 
+                 if (mHealthdConfig->batteryStatusPath.empty()) {
+@@ -907,8 +939,17 @@ void BatteryMonitor::init(struct healthd_config *hc) {
+                     path.clear();
+                     path.appendFormat("%s/%s/charge_counter",
+                                       POWER_SUPPLY_SYSFS_PATH, name);
+-                    if (access(path.c_str(), R_OK) == 0)
++                    if (access(path.c_str(), R_OK) == 0) {
+                         mHealthdConfig->batteryChargeCounterPath = path;
++                    } else {
++                        // Some ACPI batteries only expose charge_now, which is
++                        // the same quantity (uAh) as charge_counter.
++                        path.clear();
++                        path.appendFormat("%s/%s/charge_now",
++                                          POWER_SUPPLY_SYSFS_PATH, name);
++                        if (access(path.c_str(), R_OK) == 0)
++                            mHealthdConfig->batteryChargeCounterPath = path;
++                    }
+                 }
+ 
+                 if (mHealthdConfig->batteryTemperaturePath.empty()) {
+diff --git a/healthd/include/healthd/BatteryMonitor.h b/healthd/include/healthd/BatteryMonitor.h
+index b30458d3cc..7262f447b6 100644
+--- a/healthd/include/healthd/BatteryMonitor.h
++++ b/healthd/include/healthd/BatteryMonitor.h
+@@ -86,6 +86,7 @@ class BatteryMonitor {
+     int setChargingPolicy(int value);
+     int getChargingPolicy();
+     int getBatteryHealthData(int id);
++    int64_t getBatteryStateOfHealth();
+ 
+     status_t getSerialNumber(std::optional<std::string>* out);
+ 
+-- 
+2.43.0
+
